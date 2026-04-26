@@ -88,6 +88,7 @@ from plots import (
 )
 
 
+
 # small io helpers for tables and cached arrays
 def _save_table(df: pd.DataFrame, stem: str) -> Path:
     """Write ``df`` to ``results/tables/{stem}.csv`` and return the path."""
@@ -306,14 +307,16 @@ def run_formalized_divergence(
     3. A class-label permutation null envelope plus a per-window and
        peak p-value.
 
-    Produces Figure 3 per subset and one joint summary table.
+    Produces one combined Figure 3 and one joint summary table.
     """
     subs = define_fixed_subsets(ds["electrode_group"])
     rows = []
     figs: Dict[str, dict] = {}
     curves_per_subset = {}
 
-    for name in ("all", "no_song", "song_only"):
+    subset_names = [name for name in ("all", "no_song", "song_only") if name in subs]
+
+    for name in subset_names:
         sub = ds["X_tensor"][subs[name]]
 
         observed = time_resolved_divergence(
@@ -347,14 +350,6 @@ def run_formalized_divergence(
 
         curves_per_subset[name] = {"observed": observed, "boot": boot, "perm": perm}
 
-        figs[name] = plot_divergence_with_stats(
-            observed=observed,
-            boot_ci=boot,
-            perm_envelope=perm,
-            title=f"Song vs music divergence - {name}",
-            stem=f"fig3_divergence_{name}",
-        )
-
         _save_cache(
             f"divergence_{name}",
             time=observed["time"],
@@ -379,6 +374,27 @@ def run_formalized_divergence(
                 "p_peak_permutation": float(perm["p_peak"]),
             }
         )
+
+    combined_curves = {}
+    for name in subset_names:
+        observed = curves_per_subset[name]["observed"]
+        boot = curves_per_subset[name]["boot"]
+        combined_curves[name] = {
+            "time": observed["time"],
+            "divergence": observed["divergence"],
+            "divergence_ci_lo": boot["ci_lo"],
+            "divergence_ci_hi": boot["ci_hi"],
+        }
+
+    figs["combined"] = plot_time_resolved_curves(
+        curves=combined_curves,
+        metric_key="divergence",
+        chance=None,
+        title="Song vs music divergence",
+        ylabel="divergence (between - within)",
+        stem="fig3_divergence_combined",
+        ci_key="divergence_ci",
+    )
 
     summary = pd.DataFrame(rows)
     _save_table(summary, "divergence_stats")
@@ -833,6 +849,311 @@ def run_bellier_profiles(*, ds_norman: Optional[dict] = None, seed=RANDOM_STATE)
     }
 
 
+def bellier_build_component_tensor(supergrid,
+                                   vocal_present,
+                                   window_size,
+                                   step_size=None,
+                                   label_threshold=0.5,
+                                   min_valid_frac=0.8):
+    """Build Bellier tensor D for component modeling.
+
+    Args:
+        supergrid: dict with at least:
+            'hfa'        -> [time x electrode]
+            'artifacts'  -> [time x electrode] boolean
+        vocal_present: [time] binary array
+        window_size: number of samples per window
+        step_size: hop between windows, defaults to window_size
+        label_threshold: fraction of vocal samples needed to label a window vocal
+        min_valid_frac: minimum artifact-free fraction required per electrode/window
+
+    Returns:
+        Z dict with:
+            D               [window x time x electrode]
+            y               [window] binary labels (1=vocal, 0=instrumental)
+            keep_windows    [window] original start indices
+            valid_mask      [window x electrode] whether electrode/window is valid
+    """
+
+    if step_size is None:
+        step_size = window_size
+
+    X = np.asarray(supergrid['hfa'], dtype=np.float32)
+    artifacts = np.asarray(supergrid['artifacts'], dtype=bool)
+    vocal_present = np.asarray(vocal_present).astype(np.float32)
+
+    n_time, n_elec = X.shape
+    starts = np.arange(0, n_time - window_size + 1, step_size)
+
+    D = []
+    y = []
+    valid_mask = []
+    keep_windows = []
+
+    for s in starts:
+        e = s + window_size
+
+        x_win = X[s:e, :].copy()
+        a_win = artifacts[s:e, :]
+
+        # fraction of valid samples for each electrode in this window
+        valid_frac = 1.0 - np.mean(a_win, axis=0)
+        vmask = valid_frac >= min_valid_frac
+
+        # replace artifact samples with 0; model is simple and expects dense tensor
+        x_win[a_win] = 0.0
+
+        # zero out bad electrode/windows entirely
+        x_win[:, ~vmask] = 0.0
+
+        frac_vocal = np.mean(vocal_present[s:e])
+        y_win = np.int32(frac_vocal >= label_threshold)
+
+        D.append(x_win[np.newaxis, :, :])
+        y.append(y_win)
+        valid_mask.append(vmask[np.newaxis, :])
+        keep_windows.append(s)
+
+    D = np.concatenate(D, axis=0)                  # [window x time x electrode]
+    y = np.asarray(y, dtype=np.int32)              # [window]
+    valid_mask = np.concatenate(valid_mask, axis=0)  # [window x electrode]
+    keep_windows = np.asarray(keep_windows, dtype=np.int32)
+
+    Z = {
+        'D': D,
+        'y': y,
+        'valid_mask': valid_mask,
+        'keep_windows': keep_windows,
+        'window_size': window_size,
+        'step_size': step_size,
+    }
+
+    return Z
+
+
+def bellier_fit_vocal_components(D,
+                                 K,
+                                 activation_penalty,
+                                 activation_scale=0.001,
+                                 n_iter=10000,
+                                 n_iter_per_eval=20,
+                                 seed=0,
+                                 kernel_size=None,
+                                 step_size=[0.01, 0.0032, 0.001, 0.0003, 0.0001]):
+    """Fit the simple Norman-Haignere component model to Bellier windows.
+
+    Args:
+        D: [window x time x electrode]
+        K: number of components
+        activation_penalty: L1 penalty on activations
+        other args are passed directly to train_simple
+
+    Returns:
+        output dict from train_simple
+    """
+    try:
+        from HaignereModel import train_simple
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "The Bellier component model requires TensorFlow. "
+            "Use the TensorFlow-enabled kernel/environment for this function."
+        ) from exc
+    Z = train_simple(
+        D=D,
+        K=K,
+        activation_penalty=activation_penalty,
+        activation_scale=activation_scale,
+        n_iter=n_iter,
+        n_iter_per_eval=n_iter_per_eval,
+        seed=seed,
+        kernel_size=kernel_size,
+        step_size=step_size,
+    )
+
+    return Z
+
+
+def bellier_component_vocal_selectivity(model_fit,
+                                        y,
+                                        n_perm=1000,
+                                        seed=0):
+    """Measure vocal preference of fitted components.
+
+    Args:
+        model_fit: output of train_simple or train_complex
+        y: [window] binary labels (1=vocal, 0=instrumental)
+
+    Returns:
+        dict with component selectivity statistics
+    """
+
+    rng = np.random.RandomState(seed)
+
+    R = model_fit['R']   # [window x time x component]
+    K = R.shape[2]
+
+    comp_mean = np.mean(R, axis=1)   # [window x component]
+
+    mean_vocal = np.zeros(K)
+    mean_instr = np.zeros(K)
+    diff = np.zeros(K)
+    p = np.zeros(K)
+
+    vocal_ix = (y == 1)
+    instr_ix = (y == 0)
+
+    for k in range(K):
+        x = comp_mean[:, k]
+
+        mean_vocal[k] = np.mean(x[vocal_ix])
+        mean_instr[k] = np.mean(x[instr_ix])
+        diff[k] = mean_vocal[k] - mean_instr[k]
+
+        null = np.zeros(n_perm)
+        for i in range(n_perm):
+            yperm = rng.permutation(y)
+            null[i] = np.mean(x[yperm == 1]) - np.mean(x[yperm == 0])
+
+        p[k] = (1 + np.sum(null >= diff[k])) / (n_perm + 1)
+
+    order = np.argsort(-diff)
+
+    Z = {
+        'mean_vocal': mean_vocal,
+        'mean_instr': mean_instr,
+        'diff': diff,
+        'p': p,
+        'order': order,
+        'best_component': order[0],
+        'component_mean_timecourse': np.mean(R, axis=0),  # [time x component]
+    }
+
+    return Z
+
+
+def bellier_electrode_weights_for_component(model_fit,
+                                            component_index,
+                                            supergrid=None):
+    """Return electrode weights for one selected component.
+
+    Args:
+        model_fit: output of train_simple/train_complex
+        component_index: integer
+        supergrid: optional Bellier metadata dict
+
+    Returns:
+        dict with electrode weights and optional metadata
+    """
+
+    W = model_fit['W']   # [component x electrode]
+    w = W[component_index, :]
+
+    order = np.argsort(-w)
+
+    Z = {
+        'weights': w,
+        'order': order,
+        'component_index': component_index,
+    }
+
+    if supergrid is not None:
+        for key in ['patient_id', 'channel_label', 'group', 'hemi', 'anatomy_raw', 'mni']:
+            if key in supergrid:
+                Z[key] = supergrid[key]
+
+    return Z
+
+
+def bellier_top_vocal_electrodes(model_fit,
+                                 component_stats,
+                                 supergrid=None,
+                                 top_n=25):
+    """Get the top electrodes for the most vocal-preferring component."""
+
+    k = component_stats['best_component']
+    ew = bellier_electrode_weights_for_component(model_fit, k, supergrid=supergrid)
+
+    order = ew['order'][:top_n]
+
+    Z = {
+        'component_index': k,
+        'component_diff': component_stats['diff'][k],
+        'component_p': component_stats['p'][k],
+        'electrode_index': order,
+        'weights': ew['weights'][order],
+    }
+
+    if supergrid is not None:
+        for key in ['patient_id', 'channel_label', 'group', 'hemi', 'anatomy_raw']:
+            if key in ew:
+                Z[key] = np.asarray(ew[key])[order]
+
+    return Z
+
+
+def run_bellier_vocal_component_model(supergrid,
+                                      vocal_present,
+                                      K=10,
+                                      activation_penalty=0.01,
+                                      window_size=50,
+                                      step_size=50,
+                                      label_threshold=0.5,
+                                      min_valid_frac=0.8,
+                                      n_perm=1000,
+                                      seed=0,
+                                      activation_scale=0.001,
+                                      n_iter=10000,
+                                      n_iter_per_eval=20,
+                                      kernel_size=None,
+                                      train_step_size=[0.01, 0.0032, 0.001, 0.0003, 0.0001]):
+    """Full Bellier vocal-component pipeline, in the style of the pasted repo."""
+
+    
+    data = bellier_build_component_tensor(
+        supergrid=supergrid,
+        vocal_present=vocal_present,
+        window_size=window_size,
+        step_size=step_size,
+        label_threshold=label_threshold,
+        min_valid_frac=min_valid_frac,
+    )
+
+    model_fit = bellier_fit_vocal_components(
+        D=data['D'],
+        K=K,
+        activation_penalty=activation_penalty,
+        activation_scale=activation_scale,
+        n_iter=n_iter,
+        n_iter_per_eval=n_iter_per_eval,
+        seed=seed,
+        kernel_size=kernel_size,
+        step_size=train_step_size,
+    )
+
+    component_stats = bellier_component_vocal_selectivity(
+        model_fit=model_fit,
+        y=data['y'],
+        n_perm=n_perm,
+        seed=seed,
+    )
+
+    top_electrodes = bellier_top_vocal_electrodes(
+        model_fit=model_fit,
+        component_stats=component_stats,
+        supergrid=supergrid,
+        top_n=25,
+    )
+
+    Z = {
+        'data': data,
+        'model_fit': model_fit,
+        'component_stats': component_stats,
+        'top_electrodes': top_electrodes,
+    }
+
+    return Z    
+
+
 # top level orchestration that runs every section end to end
 def run_all(*, n_subsets=RANDOM_SUBSETS_N, n_boot=BOOTSTRAP_N, n_perm=PERM_N, seed=RANDOM_STATE, skip: Optional[list] = None, include_bellier: bool = True):
     """Run every analysis end-to-end and write ``results/metrics.json``.
@@ -944,3 +1265,125 @@ if __name__ == "__main__":  # pragma: no cover
         skip=args.skip,
         include_bellier=not args.no_bellier,
     )
+
+def run_bellier_matched_random_subset_control(
+    bellier_component_out: dict,
+    *,
+    n_subsets: int = 1000,
+    subset_size: int = 7,
+    seed: int = RANDOM_STATE,
+    save: bool = True,
+):
+    """Bellier matched random-subset control for vocal-vs-instrumental decoding.
+
+    Compares the top component-loading electrodes against a null
+    distribution of matched random subsets of the same size.
+
+    Parameters
+    ----------
+    bellier_component_out : dict
+        Output of run_bellier_vocal_component_model(...).
+    n_subsets : int
+        Number of random matched subsets.
+    subset_size : int
+        Number of electrodes in the true subset and each random subset.
+    seed : int
+        RNG seed.
+    save : bool
+        Whether to save summary/null tables.
+
+    Returns
+    -------
+    dict
+        {
+            "summary": pd.DataFrame,
+            "null_scores": np.ndarray,
+            "true_score": float,
+            "empirical_p_greater": float,
+            "subset_indices": list[np.ndarray],
+            "true_subset": np.ndarray,
+        }
+    """
+    sg = build_supergrid(cache=True, verbose=False)
+    vocal_mask = load_vocal_segments()
+    rng = np.random.default_rng(seed)
+
+    true_subset = np.asarray(
+        bellier_component_out["top_electrodes"]["electrode_index"][:subset_size],
+        dtype=int,
+    )
+
+    all_idx = np.arange(sg["hfa"].shape[1], dtype=int)
+    pool_idx = np.setdiff1d(all_idx, true_subset)
+
+    # --- evaluate the true subset once ---
+    true_res = run_vocal_instrumental_decoder(
+        sg,
+        {"true_subset": true_subset},
+        vocal_mask,
+        subsets=["true_subset"],
+        seed=seed,
+    )
+    true_score = float(
+        true_res["summary"]
+        .query("model == 'logreg'")["mean_bacc"]
+        .iloc[0]
+    )
+
+    # --- build null distribution over matched random subsets ---
+    null_scores = np.zeros(n_subsets, dtype=float)
+    subset_indices = []
+
+    for i in range(n_subsets):
+        rand_idx = np.asarray(
+            rng.choice(pool_idx, size=subset_size, replace=False),
+            dtype=int,
+        )
+        subset_indices.append(rand_idx)
+
+        res = run_vocal_instrumental_decoder(
+            sg,
+            {"rand_subset": rand_idx},
+            vocal_mask,
+            subsets=["rand_subset"],
+            seed=seed,
+        )
+        null_scores[i] = float(
+            res["summary"]
+            .query("model == 'logreg'")["mean_bacc"]
+            .iloc[0]
+        )
+
+    empirical_p_greater = (1 + np.sum(null_scores >= true_score)) / (n_subsets + 1)
+
+    summary = pd.DataFrame(
+        [{
+            "task": "bellier_vocal_vs_instrumental",
+            "subset_size": subset_size,
+            "n_random_subsets": n_subsets,
+            "true_score": true_score,
+            "null_mean": float(np.mean(null_scores)),
+            "null_std": float(np.std(null_scores)),
+            "null_median": float(np.median(null_scores)),
+            "empirical_p_greater": float(empirical_p_greater),
+        }]
+    )
+
+    if save:
+        _save_table(summary, "bellier_matched_random_subset_summary")
+        _save_cache(
+            "bellier_matched_random_subset_null",
+            null_scores=null_scores,
+            true_score=np.array([true_score]),
+            true_subset=true_subset,
+            subset_indices=np.array(subset_indices, dtype=int),
+        )
+
+    return {
+        "summary": summary,
+        "null_scores": null_scores,
+        "true_score": true_score,
+        "empirical_p_greater": float(empirical_p_greater),
+        "subset_indices": subset_indices,
+        "true_subset": true_subset,
+    }
